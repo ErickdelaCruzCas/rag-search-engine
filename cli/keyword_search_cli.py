@@ -9,9 +9,10 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 import argparse
-from cli.search_engine import MovieSearchEngine
-from cli.inverted_index import InvertedIndex
-from cli.data_loader import load_movies
+from cli.search_engines.linear_search import MovieSearchEngine
+from cli.search_engines.inverted_index import InvertedIndex
+from cli.data_loader import load_movies, load_stopwords
+from cli.tokenizer import Tokenizer
 
 
 def display_results(movies: list[dict]) -> None:
@@ -31,23 +32,25 @@ def main() -> None:
     build_parser = subparsers.add_parser("build", help="Build inverted index")
 
     args = parser.parse_args()
-
+    stopwords = load_stopwords()
+    tokenizer = Tokenizer(stopwords)
     match args.command:
-        
+
         case "build":
             print("Building inverted index...")
-            # 1. Cargar películas
-
+            # 1. Load movies and stopwords
             movies = load_movies()
+            
 
-            # 2. Construir índice
-            index = InvertedIndex()
+            # 2. Create tokenizer and build index
+            
+            index = InvertedIndex(tokenizer)
             index.build(movies)
 
-            # 3. Guardar en disco
+            # 3. Save to disk
             index.save()
 
-            # 4. Verificar token 'merida'
+            # 4. Verify token 'merida'
             docs = index.get_documents("merida")
             if docs:
                 print(f"First document ID for token 'merida': {docs[0]}")
@@ -56,9 +59,17 @@ def main() -> None:
 
         case "search":
             print(f"Searching for: {args.query}")
-            search_engine = MovieSearchEngine()
-            results = search_engine.search(args.query)
-            display_results(results)
+
+            index = InvertedIndex(tokenizer)
+            index.load()
+            index_results = index.search(args.query)
+            display_results(index_results)
+
+
+
+            # search_engine = MovieSearchEngine()
+            # results = search_engine.search(args.query)
+            # display_results(results)
         case _:
             parser.print_help()
 
