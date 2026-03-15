@@ -2,6 +2,8 @@ import os
 import pickle
 from typing import Dict, Set, List, Any
 from cli.tokenizer import Tokenizer
+from collections import Counter
+from tqdm import tqdm
 
 
 class InvertedIndex:
@@ -20,9 +22,12 @@ class InvertedIndex:
         Attributes:
             index: Dictionary mapping tokens (str) to sets of document IDs (int).
             docmap: Dictionary mapping document IDs (int) to full document objects.
+            term_frequencies: Dictionary mapping document IDs (int) to Counter objects
+                            that track term frequencies within each document.
         """
         self.index: Dict[str, Set[int]] = {}
         self.docmap: Dict[int, Any] = {}
+        self.term_frequencies: Dict[int, Counter] = {}
         self.tokenizer = tokenizer
 
     def __add_document(self, doc_id: int, text: str) -> None:
@@ -30,7 +35,8 @@ class InvertedIndex:
         Add a document to the inverted index.
 
         The text is tokenized and each token is associated
-        with the provided document ID.
+        with the provided document ID. Also tracks term frequencies
+        for each document.
 
         Args:
             doc_id: Unique identifier of the document.
@@ -38,11 +44,18 @@ class InvertedIndex:
         """
         tokens = self.tokenizer.tokenize(text)
 
+        # Initialize Counter for this document if it doesn't exist
+        if doc_id not in self.term_frequencies:
+            self.term_frequencies[doc_id] = Counter()
+
         for token in tokens:
+            # Add to inverted index
             if token not in self.index:
                 self.index[token] = set()
-
             self.index[token].add(doc_id)
+
+            # Update term frequency for this document
+            self.term_frequencies[doc_id][token] += 1
 
     def get_documents(self, term: str) -> List[int]:
         """
@@ -75,7 +88,7 @@ class InvertedIndex:
             movies: List of movie dictionaries. Each dictionary
                     must contain at least 'id', 'title', and 'description'.
         """
-        for m in movies:
+        for m in tqdm(movies, desc="Building index", unit="movies"):
             doc_id: int = m["id"]
             self.docmap[doc_id] = m
 
@@ -84,35 +97,43 @@ class InvertedIndex:
 
     def save(self) -> None:
         """
-        Persist the index and document map to disk using pickle.
+        Persist the index, document map, and term frequencies to disk using pickle.
 
         Files created:
-            cache/index.pkl  - serialized inverted index
-            cache/docmap.pkl - serialized document map
+            cache/index.pkl            - serialized inverted index
+            cache/docmap.pkl           - serialized document map
+            cache/term_frequencies.pkl - serialized term frequency counters
 
         The cache directory is created automatically if it does not exist.
         """
         os.makedirs("cache", exist_ok=True)
 
-        with open("cache/index.pkl", "wb") as f:
-            pickle.dump(self.index, f)
+        with open("cache/index.pkl", "wb") as i:
+            pickle.dump(self.index, i)
 
-        with open("cache/docmap.pkl", "wb") as f:
-            pickle.dump(self.docmap, f)
+        with open("cache/docmap.pkl", "wb") as d:
+            pickle.dump(self.docmap, d)
+        
+        with open("cache/term_frequencies.pkl", "wb") as tf:
+            pickle.dump(self.term_frequencies, tf)
 
     def load(self) -> None:
         """
-        Load the index and document map from disk.
+        Load the index, document map, and term frequencies from disk.
 
         Files read:
-            cache/index.pkl  - serialized inverted index
-            cache/docmap.pkl - serialized document map
+            cache/index.pkl            - serialized inverted index
+            cache/docmap.pkl           - serialized document map
+            cache/term_frequencies.pkl - serialized term frequency counters
         """
         with open("cache/index.pkl", "rb") as f:
             self.index = pickle.load(f)
 
         with open("cache/docmap.pkl", "rb") as f:
             self.docmap = pickle.load(f)
+
+        with open("cache/term_frequencies.pkl", "rb") as f:
+            self.term_frequencies = pickle.load(f)
 
     def search(self, query: str) -> List[Dict[str, Any]]:
         """
