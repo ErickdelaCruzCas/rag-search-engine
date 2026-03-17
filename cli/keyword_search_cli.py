@@ -14,6 +14,7 @@ from cli.search_engines.inverted_index import InvertedIndex
 from cli.search_engines import scorer
 from cli.data_loader import load_movies, load_stopwords
 from cli.tokenizer import Tokenizer
+from cli.constants import BM25_K1, BM25_B
 
 
 def display_results(movies: list[dict]) -> None:
@@ -38,6 +39,25 @@ def get_stemmed_term(tokenizer: Tokenizer, term: str) -> Optional[str]:
     """
     tokens = tokenizer.tokenize(term)
     return tokens[0] if tokens else None
+
+
+def handle_bm25search(args: argparse.Namespace, tokenizer: Tokenizer) -> None:
+    """Handle the BM25 search command."""
+    index = load_index(tokenizer)
+    results = index.bm25_search(args.query, args.limit)
+    for i, (movie, score) in enumerate(results, start=1):
+        print(f"{i}. ({movie['id']}) {movie['title']} - Score: {score:.2f}")
+
+
+def bm25_tf_command(doc_id: int, term: str, k1: float = BM25_K1, b: float = BM25_B) -> float:
+    """Load the index and return the BM25 TF score for a term in a document."""
+    stopwords = load_stopwords()
+    tokenizer = Tokenizer(stopwords)
+    index = load_index(tokenizer)
+    stemmed_term = get_stemmed_term(tokenizer, term)
+    bm25tf = scorer.bm25_tf(index, doc_id, stemmed_term or "", k1, b)
+    print(f"BM25 TF score of '{term}' in document '{doc_id}': {bm25tf:.2f}")
+    return bm25tf
 
 
 def bm25_idf_command(term: str) -> float:
@@ -118,6 +138,20 @@ def setup_argument_parser() -> argparse.ArgumentParser:
     tfidf_parser.add_argument("doc_id", type=int, help="Document ID")
     tfidf_parser.add_argument("term", type=str, help="Term to calculate TF-IDF for")
 
+    # BM25 TF command
+    bm25_tf_parser = subparsers.add_parser(
+        "bm25tf", help="Get BM25 TF score for a given document ID and term"
+    )
+    bm25_tf_parser.add_argument("doc_id", type=int, help="Document ID")
+    bm25_tf_parser.add_argument("term", type=str, help="Term to get BM25 TF score for")
+    bm25_tf_parser.add_argument("k1", type=float, nargs='?', default=BM25_K1, help="Tunable BM25 K1 parameter")
+    bm25_tf_parser.add_argument("b", type=float, nargs='?', default=BM25_B, help="Tunable BM25 b parameter")
+
+    # BM25 search command
+    bm25search_parser = subparsers.add_parser("bm25search", help="Search movies using full BM25 scoring")
+    bm25search_parser.add_argument("query", type=str, help="Search query")
+    bm25search_parser.add_argument("--limit", type=int, default=5, help="Number of results to return")
+
     # BM25 IDF command
     bm25_idf_parser = subparsers.add_parser(
         "bm25idf", help="Get BM25 IDF score for a term across the corpus"
@@ -153,6 +187,10 @@ def main() -> None:
             handle_idf(args, tokenizer)
         case "tfidf":
             handle_tfidf(args, tokenizer)
+        case "bm25search":
+            handle_bm25search(args, tokenizer)
+        case "bm25tf":
+            bm25_tf_command(args.doc_id, args.term, args.k1, args.b)
         case "bm25idf":
             bm25_idf_command(args.term)
         case _:

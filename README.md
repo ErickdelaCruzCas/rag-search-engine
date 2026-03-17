@@ -174,6 +174,36 @@ The CLI exposes all three metrics as individual commands so you can inspect the 
 
 ---
 
+### 7. BM25 (Best Match 25)
+
+TF-IDF has a flaw: raw TF is unbounded. A term that appears 100 times scores 100× higher than one that appears once, even though in practice the relevance gain tapers off long before that.
+
+**BM25 fixes this with a saturation formula for TF:**
+
+```
+BM25_TF(term, doc) = (tf × (k1 + 1)) / (tf + k1)
+```
+
+The `k1` parameter (default `1.5`) controls how fast the score saturates. As `tf` grows, the result asymptotically approaches `k1 + 1` — it never exceeds it, no matter how many times the term appears.
+
+| tf | BM25_TF (k1=1.5) |
+|----|-----------------|
+| 1  | 1.00            |
+| 2  | 1.40            |
+| 5  | 1.67            |
+| 10 | 1.77            |
+| 100| 1.97            |
+
+**BM25 IDF** uses a different formula than classic IDF, which penalises very frequent terms more aggressively:
+
+```
+BM25_IDF(term) = log( (N - df + 0.5) / (df + 0.5) + 1 )
+```
+
+The scoring functions live in `cli/search_engines/scorer.py` (`bm25_tf`, `bm25_idf`).
+
+---
+
 ## Setup
 
 ```bash
@@ -200,6 +230,13 @@ keyword-search idf robot
 
 # Get TF-IDF score of "war" in document 7
 keyword-search tfidf 7 war
+
+# Get BM25 TF score of "love" in document 1 (optional custom k1)
+keyword-search bm25tf 1 love
+keyword-search bm25tf 1 love 2.0
+
+# Get BM25 IDF score of "robot"
+keyword-search bm25idf robot
 ```
 
 ---

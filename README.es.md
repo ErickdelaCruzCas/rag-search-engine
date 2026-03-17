@@ -281,10 +281,22 @@ Sistemas de recuperación basados en coincidencia exacta de términos.
 - **Búsqueda lineal O(n):** recorre todos los documentos en cada consulta. Simple pero inescalable.
 - **Índice invertido:** estructura `token → {doc_ids}` que convierte la búsqueda en una consulta O(1) al diccionario. Base de todos los motores de búsqueda reales.
 - **Lógica booleana:** operaciones AND (intersección de conjuntos), OR (unión), NOT (diferencia) sobre los posting lists del índice.
-- **BM25 (Best Match 25):** evolución de TF-IDF que añade saturación de frecuencia (un término que aparece 100 veces no vale 100 veces más que uno que aparece 10) y normalización por longitud del documento. Es el estándar en búsqueda por palabras clave moderna.
-  ```
-  BM25 = IDF × (TF × (k1 + 1)) / (TF + k1 × (1 - b + b × |doc| / avgdl))
-  ```
+- **BM25 (Best Match 25):** evolución de TF-IDF que resuelve un problema de TF clásico: el TF puro no tiene límite. Un término que aparece 100 veces puntúa 100× más que uno que aparece una, aunque la ganancia de relevancia real se agota mucho antes. BM25 añade **saturación de frecuencia** y normalización por longitud del documento. Es el estándar en búsqueda por palabras clave moderna.
+  - **BM25 TF (saturación):** limita el crecimiento del score a medida que aumenta la frecuencia. El parámetro `k1` (por defecto `1.5`) controla la velocidad de saturación — el score se acerca asintóticamente a `k1 + 1` sin importar cuántas veces aparezca el término.
+    ```
+    BM25_TF(t, doc) = (tf × (k1 + 1)) / (tf + k1)
+    ```
+    | tf  | BM25_TF (k1=1.5) |
+    |-----|-----------------|
+    | 1   | 1.00            |
+    | 2   | 1.40            |
+    | 5   | 1.67            |
+    | 10  | 1.77            |
+    | 100 | 1.97            |
+  - **BM25 IDF:** penaliza los términos frecuentes más agresivamente que el IDF clásico.
+    ```
+    BM25_IDF(t) = log( (N - df + 0.5) / (df + 0.5) + 1 )
+    ```
 - **Posting list:** lista de documentos asociada a cada término en el índice invertido.
 
 **Limitación:** solo encuentra lo que el usuario escribe textualmente. No entiende sinónimos ni contexto semántico.
