@@ -13,13 +13,17 @@ rag-search-engine/
 ├── cli/
 │   ├── keyword_search_cli.py      # Keyword search CLI entry point
 │   ├── semantic_search_cli.py     # Semantic search CLI entry point
+│   ├── hybrid_search_cli.py       # Hybrid search CLI entry point
 │   ├── data_loader.py             # Loads movies and stopwords from disk
 │   ├── tokenizer.py               # Text normalization, stemming pipeline
+│   ├── lib/
+│   │   └── search_utils.py        # Shared utilities (normalize, semantic_chunk, SCORE_PRECISION)
 │   └── search_engines/
 │       ├── scorer.py              # TF-IDF and BM25 scoring functions
 │       ├── linear_search.py       # Naive O(n) search (deprecated)
 │       ├── inverted_index.py      # Efficient index-based search + BM25
-│       └── semantic_search.py     # Embedding-based semantic search
+│       ├── semantic_search.py     # Embedding-based semantic search
+│       └── hybrid_search.py       # Hybrid search (weighted + RRF)
 ├── data/
 │   ├── movies.json                # Movie corpus (title + description)
 │   └── stopwords.txt              # Words to ignore during indexing
@@ -303,6 +307,191 @@ All three main approaches share the same two properties:
 
 ---
 
+### 12. Hybrid Search
+
+Neither keyword search nor semantic search is universally better. Keyword search excels at exact matches — product codes, proper nouns, technical terms. Semantic search excels at conceptual queries — synonyms, paraphrases, intent. Hybrid search combines both to get the best of each.
+
+The `HybridSearch` class ([cli/search_engines/hybrid_search.py](cli/search_engines/hybrid_search.py)) runs both searches in parallel and merges the results using one of two strategies.
+
+---
+
+### 13. Weighted Hybrid Search (Alpha)
+
+The simplest fusion strategy: normalize both score lists to [0, 1] using min-max normalization, then compute a weighted average.
+
+```
+hybrid_score = α × bm25_normalized + (1 - α) × semantic_normalized
+```
+
+- `α = 1.0` → pure BM25 (keyword only)
+- `α = 0.0` → pure semantic
+- `α = 0.5` → equal weight (default)
+
+**Min-max normalization** rescales scores so the best result in each list gets 1.0 and the worst gets 0.0:
+
+```
+normalized = (score - min) / (max - min)
+```
+
+This makes BM25 and cosine similarity scores comparable despite having different ranges. The tradeoff is that normalization is sensitive to outliers — one extremely high score compresses all others toward zero.
+
+---
+
+### 14. Reciprocal Rank Fusion (RRF)
+
+RRF is a rank-based fusion method that ignores the actual scores entirely and only uses the position of each result in each ranked list.
+
+```
+RRF_score(doc) = Σ  1 / (k + rank_in_list)
+```
+
+For each ranked list a document appears in, its contribution is `1 / (k + rank)`. Contributions are summed across all lists. The constant `k` (default 60) prevents top-ranked results from dominating too heavily.
+
+**Why this works:** a document ranked #1 in BM25 and #1 in semantic search gets `1/61 + 1/61 ≈ 0.033`. A document ranked #1 in only one list gets `1/61 ≈ 0.016`. Documents that consistently rank well across both methods float to the top.
+
+**Advantages over weighted search:**
+- No score normalization needed — ranks are already comparable
+- Robust to outliers (a BM25 score of 100 vs 1 both just become "rank 1")
+- Works even when score distributions are completely different
+
+| Property | Weighted (Alpha) | RRF |
+|---|---|---|
+| Uses scores | Yes (normalized) | No (ranks only) |
+| Sensitive to outliers | Yes | No |
+| Tunable | Yes (α) | Yes (k) |
+| Typical k/α default | α = 0.5 | k = 60 |
+
+---
+
+### 15. LLM Query Enhancement
+
+Before running a search, the query itself can be improved using a language model. This is especially useful when users write vague, misspelled, or underspecified queries.
+
+The `--enhance` flag on `rrf-search` supports three strategies:
+
+| Strategy | What it does | Example |
+|----------|-------------|---------|
+| `spell` | Fixes typos. Outputs the corrected query unchanged if there are no errors. | `"scray movei"` → `"scary movie"` |
+| `rewrite` | Rewrites the query to be more specific and searchable (Google-style). | `"bear movie with leo"` → `"The Revenant Leonardo DiCaprio bear attack"` |
+| `expand` | Appends related synonyms and concepts to the original query. | `"scary bear"` → `"scary bear horror grizzly terrifying film"` |
+
+All three strategies call **Gemma** (via the Google AI API) and print the transformation before running the search:
+
+```
+Enhanced query (rewrite): 'bear movie with leo' -> 'The Revenant Leonardo DiCaprio bear'
+```
+
+**When to use each:**
+- `spell` — for production systems where users make typos
+- `rewrite` — when the query is conceptual and needs to be grounded (e.g. movie trivia)
+- `expand` — when you want broader recall at the cost of some precision
+
+---
+
+### 16. Re-ranking
+
+The initial RRF results are a good approximation of relevance, but the ranking can be improved with a dedicated re-ranker that scores each document more carefully against the query. The `--rerank-method` flag on `rrf-search` fetches 5× the requested results, re-ranks them, then returns the top-k.
+
+Three strategies are supported:
+
+| Method | How it works | Speed | Quality |
+|--------|-------------|-------|---------|
+| `individual` | Sends one LLM prompt per document asking for a 0–10 relevance score | Slow (1 call × N docs + rate-limit sleep) | High (LLM understands intent) |
+| `batch` | Sends a single LLM prompt with all documents, asks for a ranked JSON list of IDs | Fast (1 call total) | Good (may lose nuance at scale) |
+| `cross_encoder` | Uses a local `CrossEncoder` model (`ms-marco-TinyBERT-L2-v2`) to score all pairs in one batch | Very fast (local, GPU-optional) | High (cross-attention sees query+doc together) |
+
+**Why cross-encoders beat bi-encoders for re-ranking:**
+
+A bi-encoder (like the one used for semantic search) embeds the query and document *separately*, then compares them with cosine similarity. It's fast but loses cross-document context. A cross-encoder receives the query and document *concatenated* — its attention layers can directly relate every query token to every document token, producing a much more accurate relevance score. The trade-off is that it can't pre-compute document embeddings, so it's only practical for a small candidate set (the top results from the fast retrieval stage).
+
+```
+Retrieval (bi-encoder, all N docs)  →  top-25 candidates
+Re-ranking (cross-encoder, 25 pairs) →  top-5 final results
+LLM generation                       →  grounded answer
+```
+
+---
+
+### 17. Evaluation (Precision@K and Recall@K)
+
+A **golden dataset** is a curated set of (query, relevant documents) pairs created by human experts. It's the ground truth used to measure whether the search system is actually returning the right results.
+
+Two standard retrieval metrics computed at a cutoff of K results:
+
+**Precision@K** — of the K documents retrieved, what fraction is relevant?
+
+```
+Precision@K = |retrieved ∩ relevant| / K
+```
+
+High precision means few irrelevant results in the top-K. It goes down as K increases if the extra results are noise.
+
+**Recall@K** — of all relevant documents that exist, what fraction appears in the top-K?
+
+```
+Recall@K = |retrieved ∩ relevant| / |relevant|
+```
+
+High recall means the system found most of the right answers. It goes up as K increases but at the cost of precision.
+
+**The precision-recall trade-off:** increasing K always improves recall (more results = more chances to include relevant ones) but hurts precision (more irrelevant results dilute the set). The right balance depends on the use case — a RAG system passing context to an LLM usually wants high precision (fewer, better chunks); a research tool might prefer high recall.
+
+```bash
+# Evaluate with default k=5
+uv run cli/evaluation_cli.py
+
+# Evaluate with k=10
+uv run cli/evaluation_cli.py --limit 10
+```
+
+---
+
+### 18. Augmented Generation (RAG)
+
+Once the top-K documents are retrieved, they are passed as context to an LLM to generate a grounded answer. This is the "AG" in RAG — the LLM synthesizes the retrieved evidence rather than relying solely on its parametric memory.
+
+Four generation modes are implemented in `cli/augmented_generation_cli.py`:
+
+| Command | Purpose |
+|---------|---------|
+| `rag` | General-purpose Q&A grounded in retrieved documents |
+| `summarize` | Multi-document synthesis — describes all results in a compact, information-dense response |
+| `citations` | Answers with inline citations `[1]`, `[2]`… tied to source documents |
+| `question` | Casual conversational Q&A — direct and friendly, no jargon |
+
+All four follow the same pipeline:
+
+```
+Query → RRF Search (top-K docs) → LLM prompt (query + docs) → Generated answer
+```
+
+The key difference from a standalone LLM is **grounding**: the model can only reference what's in the retrieved documents. This reduces hallucination and makes answers auditable.
+
+---
+
+### 19. Multimodal Search (CLIP)
+
+Standard text search requires the user to describe what they want in words. Multimodal search lets users query with an image instead — or with a combination of image and text.
+
+**CLIP** (Contrastive Language-Image Pretraining) is a model trained on image-text pairs. It learns a shared embedding space where images and their descriptions land near each other. This means:
+
+- An image of Paddington Bear → embedding near `"Paddington bear London marmalade"`
+- A query `"bear in London"` → embedding near that same image
+
+The `MultimodalSearch` class (`cli/lib/multimodal_search.py`) pre-encodes all movie text descriptions using CLIP, then at search time encodes the query image and finds the nearest texts using cosine similarity — the same operation as semantic search, but the query is an image instead of a text string.
+
+**Multimodal query rewriting** (`cli/describe_image_cli.py`) goes one step further: a vision-capable LLM (Gemini) receives the image + a text query and rewrites the query to be more specific. For example:
+
+```
+Image: [photo of Paddington Bear]
+Query: "bear movie"
+→ Rewritten: "Paddington Bear film London"
+```
+
+This rewritten query can then be fed into the standard text search pipeline for higher-quality results.
+
+---
+
 ## Setup
 
 ```bash
@@ -356,23 +545,80 @@ python cli/semantic_search_cli.py embedquery "space adventure"
 python cli/semantic_search_cli.py verify_embeddings
 ```
 
+```bash
+# Hybrid search — weighted combination of BM25 and semantic
+uv run cli/hybrid_search_cli.py weighted-search "space adventure"
+uv run cli/hybrid_search_cli.py weighted-search "space adventure" --alpha 0.7 --limit 10
+
+# Hybrid search — Reciprocal Rank Fusion
+uv run cli/hybrid_search_cli.py rrf-search "space adventure"
+uv run cli/hybrid_search_cli.py rrf-search "space adventure" -k 60 --limit 10
+
+# LLM query enhancement before search
+uv run cli/hybrid_search_cli.py rrf-search "scray movei with bear" --enhance spell
+uv run cli/hybrid_search_cli.py rrf-search "bear movie with leo" --enhance rewrite
+uv run cli/hybrid_search_cli.py rrf-search "scary bear movie" --enhance expand
+
+# Normalize a list of scores (min-max)
+uv run cli/hybrid_search_cli.py normalize 0.5 2.3 1.2 0.1
+
+# Re-ranking after RRF search
+uv run cli/hybrid_search_cli.py rrf-search "family movie about bears" --rerank-method individual
+uv run cli/hybrid_search_cli.py rrf-search "family movie about bears" --rerank-method batch
+uv run cli/hybrid_search_cli.py rrf-search "family movie about bears" --rerank-method cross_encoder --limit 25
+```
+
+```bash
+# Evaluate search quality (precision@k and recall@k)
+uv run cli/evaluation_cli.py
+uv run cli/evaluation_cli.py --limit 10
+```
+
+```bash
+# RAG — answer a query using retrieved documents
+uv run cli/augmented_generation_cli.py rag "what dinosaur movies can I watch?"
+uv run cli/augmented_generation_cli.py summarize "animated bear adventure" --limit 8
+uv run cli/augmented_generation_cli.py citations "scary bear film"
+uv run cli/augmented_generation_cli.py question "is there a good horror movie with bears?"
+```
+
+```bash
+# Multimodal search — query by image
+uv run cli/multimodal_search_cli.py image_search data/paddington.jpeg
+
+# Multimodal query rewriting with LLM (image + text → better query)
+uv run cli/describe_image_cli.py --image data/paddington.jpeg --query "bear movie"
+```
+
 ---
 
-## What's Next (RAG)
+## Next Steps
 
-This project builds the **retrieval** half of a RAG system. The pipeline so far:
+The full retrieval + generation pipeline is implemented. These are the natural next steps to turn this into a production-grade system:
 
-```
-Query → Embed → Cosine Similarity → Top-K Documents (semantic)
-Query → Tokenize → Index Lookup → BM25 Ranking → Top-K Documents (keyword)
-```
+### 1. Agentic RAG
+The current pipeline is a fixed sequence: query → retrieve → generate. An agent would decide *dynamically* what to do — whether to search, what to search for, whether the results are good enough to answer, or whether to search again with a refined query.
 
-In a full RAG setup, those top-K retrieved documents are passed as context to a language model (e.g. Claude, GPT), which then generates a grounded answer based on the retrieved evidence — rather than hallucinating from its parametric memory alone.
+This would involve implementing a ReAct loop (Reason + Act) using tool calling via the Gemini or Anthropic API, where the LLM itself decides when to invoke the search function.
 
-The next steps would be:
-- Combine keyword and semantic results with **hybrid search** (RRF fusion)
-- Add a **re-ranker** to improve result ordering
-- Pipe the top results into an **LLM prompt** for answer generation
+### 2. Vector Database
+All embeddings are currently stored as `.npy` files loaded into memory on every run. A real vector database (Qdrant, Chroma, pgvector) provides:
+- Persistent storage without loading everything into RAM
+- ANN indexing (HNSW) for sub-millisecond search at scale
+- Metadata filtering (e.g. filter by genre before vector search)
+- Built-in updates and deletions
+
+### 3. Streaming Generation
+The Gemini API supports streaming responses — the answer is printed token by token as it's generated, instead of waiting for the full response. This dramatically improves perceived latency for the user.
+
+### 4. Automated RAG Evaluation
+The evaluation script measures retrieval quality (precision/recall) but not generation quality. RAGAS is an open-source framework that uses an LLM as a judge to score:
+- **Faithfulness** — does the answer stay within the retrieved context?
+- **Answer relevance** — does it actually address the question?
+- **Context relevance** — were the retrieved chunks useful?
+
+### 5. HTTP API
+Expose the RAG pipeline as a FastAPI service so it can be called from a frontend or other services. Each generation mode (`rag`, `summarize`, `citations`, `question`) would become an endpoint.
 
 ---
 

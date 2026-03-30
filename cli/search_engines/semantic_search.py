@@ -127,15 +127,19 @@ class ChunkedSemanticSearch(SemanticSearch):
     def search_chunks(self, query: str, limit: int = 10) -> list[dict]:
         query_embedding = self.generate_embedding(query)
 
+        # Vectorized cosine similarity: (N, D) @ (D,) / norms
+        norms = np.linalg.norm(self.chunk_embeddings, axis=1)
+        query_norm = np.linalg.norm(query_embedding)
+        scores = (self.chunk_embeddings @ query_embedding) / (norms * query_norm + 1e-10)
+
         chunk_scores = []
-        for i, chunk_emb in enumerate(self.chunk_embeddings):
-            score = cosine_similarity(query_embedding, chunk_emb)
+        for i, score in enumerate(scores):
             meta = self.chunk_metadata[i]
             chunk_scores.append({
                 "global_idx": i,
                 "chunk_idx": meta["chunk_idx"],
                 "movie_idx": meta["movie_idx"],
-                "score": score,
+                "score": float(score),
             })
 
         movie_scores = {}
