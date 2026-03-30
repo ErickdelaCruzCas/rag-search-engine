@@ -15,15 +15,17 @@ rag-search-engine/
 │   ├── data_loader.py             # Carga películas y stopwords desde disco
 │   ├── tokenizer.py               # Pipeline de normalización y stemming
 │   └── search_engines/
+│       ├── scorer.py              # Funciones de scoring TF-IDF y BM25
 │       ├── linear_search.py       # Búsqueda ingenua O(n) (deprecada)
-│       └── inverted_index.py      # Búsqueda por índice + TF-IDF
+│       └── inverted_index.py      # Búsqueda por índice + BM25
 ├── data/
 │   ├── movies.json                # Corpus de películas (título + descripción)
 │   └── stopwords.txt              # Palabras a ignorar durante la indexación
 └── cache/                         # Archivos del índice persistido (auto-generado)
     ├── index.pkl
     ├── docmap.pkl
-    └── term_frequencies.pkl
+    ├── term_frequencies.pkl
+    └── doc_lengths.pkl
 ```
 
 ---
@@ -117,13 +119,14 @@ token → {conjunto de IDs de documentos que lo contienen}
 
 En tiempo de búsqueda, buscar una palabra es una consulta O(1) al diccionario — sin escaneos.
 
-La clase `InvertedIndex` ([cli/search_engines/inverted_index.py](cli/search_engines/inverted_index.py)) mantiene tres estructuras internas:
+La clase `InvertedIndex` ([cli/search_engines/inverted_index.py](cli/search_engines/inverted_index.py)) mantiene cuatro estructuras internas:
 
 | Atributo           | Tipo                          | Para qué sirve                                  |
 |--------------------|-------------------------------|--------------------------------------------------|
 | `index`            | `dict[str, set[int]]`         | Token → conjunto de IDs de documentos que lo contienen |
 | `docmap`           | `dict[int, dict]`             | ID de documento → objeto película completo      |
 | `term_frequencies` | `dict[int, Counter]`          | ID de documento → frecuencia de cada término    |
+| `doc_lengths`      | `dict[int, int]`              | ID de documento → número de palabras en crudo (para la normalización por longitud de BM25) |
 
 **Fase de construcción (build):** Se procesa el corpus entero una sola vez. El título y la descripción de cada película se tokenizan juntos y se añaden al índice.
 
@@ -176,6 +179,55 @@ El CLI expone las tres métricas como comandos independientes para que puedas in
 
 ---
 
+### 7. BM25 (Best Match 25)
+
+TF-IDF tiene un fallo: el TF puro no tiene límite. Un término que aparece 100 veces puntúa 100× más que uno que aparece una sola vez, aunque en la práctica la ganancia de relevancia se agota mucho antes.
+
+**BM25 corrige esto con dos mejoras:**
+
+#### Saturación (parámetro k1)
+
+```
+BM25_TF(término, doc) = (tf × (k1 + 1)) / (tf + k1 × (1 - b + b × |D| / avgdl))
+```
+
+El parámetro `k1` (por defecto `1.5`) controla la velocidad de saturación. A medida que `tf` crece, el resultado se aproxima asintóticamente a `k1 + 1` — nunca lo supera, por muchas veces que aparezca el término.
+
+#### Normalización por longitud (parámetro b)
+
+El término `(1 - b + b × |D| / avgdl)` normaliza por la longitud del documento, donde:
+- `|D|` = número de palabras del documento
+- `avgdl` = longitud media de los documentos del corpus
+- `b` (por defecto `0.75`) controla la fuerza de la normalización. `b=0` la desactiva; `b=1` la aplica completamente.
+
+Esto evita que los documentos largos tengan ventaja injusta: un término que aparece 5 veces en un documento corto debe puntuar más que ese mismo término apareciendo 5 veces en uno 10× más largo.
+
+| tf  | BM25_TF (k1=1.5, normalizado) |
+|-----|-------------------------------|
+| 1   | ≤ 1.00                        |
+| 2   | ≤ 1.40                        |
+| 5   | ≤ 1.67                        |
+| 10  | ≤ 1.77                        |
+| 100 | ≤ 1.97                        |
+
+#### BM25 IDF
+
+Usa una fórmula distinta al IDF clásico, que penaliza más agresivamente los términos frecuentes:
+
+```
+BM25_IDF(término) = log( (N - df + 0.5) / (df + 0.5) + 1 )
+```
+
+#### Puntuación BM25 completa
+
+```
+BM25(término, doc) = BM25_TF × BM25_IDF
+```
+
+El score final de un documento para una consulta con varios términos suma BM25 sobre todos los tokens de la consulta. Las funciones de scoring viven en [`cli/search_engines/scorer.py`](cli/search_engines/scorer.py). Las longitudes de documento se guardan en `doc_lengths` (número de palabras en crudo por documento, calculado al indexar y persistido en `cache/doc_lengths.pkl`).
+
+---
+
 ## Instalación
 
 ```bash
@@ -191,8 +243,11 @@ keyword-search build
 ## Uso
 
 ```bash
-# Buscar películas
+# Buscar películas (por palabras clave, lógica OR)
 keyword-search search "space adventure"
+
+# Buscar películas ordenadas por puntuación BM25
+keyword-search bm25search "love story"
 
 # Frecuencia de "action" en el documento 42
 keyword-search tf 42 action
@@ -202,6 +257,13 @@ keyword-search idf robot
 
 # Puntuación TF-IDF de "war" en el documento 7
 keyword-search tfidf 7 war
+
+# Puntuación BM25 TF de "love" en el documento 1 (k1 y b opcionales)
+keyword-search bm25tf 1 love
+keyword-search bm25tf 1 love 2.0 0.5
+
+# Puntuación BM25 IDF de "robot"
+keyword-search bm25idf robot
 ```
 
 ---
@@ -281,22 +343,27 @@ Sistemas de recuperación basados en coincidencia exacta de términos.
 - **Búsqueda lineal O(n):** recorre todos los documentos en cada consulta. Simple pero inescalable.
 - **Índice invertido:** estructura `token → {doc_ids}` que convierte la búsqueda en una consulta O(1) al diccionario. Base de todos los motores de búsqueda reales.
 - **Lógica booleana:** operaciones AND (intersección de conjuntos), OR (unión), NOT (diferencia) sobre los posting lists del índice.
-- **BM25 (Best Match 25):** evolución de TF-IDF que resuelve un problema de TF clásico: el TF puro no tiene límite. Un término que aparece 100 veces puntúa 100× más que uno que aparece una, aunque la ganancia de relevancia real se agota mucho antes. BM25 añade **saturación de frecuencia** y normalización por longitud del documento. Es el estándar en búsqueda por palabras clave moderna.
-  - **BM25 TF (saturación):** limita el crecimiento del score a medida que aumenta la frecuencia. El parámetro `k1` (por defecto `1.5`) controla la velocidad de saturación — el score se acerca asintóticamente a `k1 + 1` sin importar cuántas veces aparezca el término.
+- **BM25 (Best Match 25):** evolución de TF-IDF que resuelve dos problemas del TF clásico: el TF puro no tiene límite y no tiene en cuenta la longitud del documento. BM25 añade **saturación de frecuencia** y **normalización por longitud**. Es el estándar en búsqueda por palabras clave moderna.
+  - **BM25 TF (con saturación y normalización por longitud):**
     ```
-    BM25_TF(t, doc) = (tf × (k1 + 1)) / (tf + k1)
+    BM25_TF(t, doc) = (tf × (k1 + 1)) / (tf + k1 × (1 - b + b × |D| / avgdl))
     ```
-    | tf  | BM25_TF (k1=1.5) |
-    |-----|-----------------|
-    | 1   | 1.00            |
-    | 2   | 1.40            |
-    | 5   | 1.67            |
-    | 10  | 1.77            |
-    | 100 | 1.97            |
+    - `k1` (por defecto `1.5`): controla la velocidad de saturación. El score se acerca asintóticamente a `k1 + 1`.
+    - `b` (por defecto `0.75`): controla la intensidad de la normalización por longitud. `b=0` la desactiva; `b=1` la aplica completamente.
+    - `|D|`: número de palabras del documento. `avgdl`: media de palabras por documento en el corpus.
+    - Un término que aparece 5 veces en un documento corto puntúa más que el mismo término apareciendo 5 veces en uno 10× más largo.
+    | tf  | BM25_TF (k1=1.5, normalizado) |
+    |-----|-------------------------------|
+    | 1   | ≤ 1.00                        |
+    | 2   | ≤ 1.40                        |
+    | 5   | ≤ 1.67                        |
+    | 10  | ≤ 1.77                        |
+    | 100 | ≤ 1.97                        |
   - **BM25 IDF:** penaliza los términos frecuentes más agresivamente que el IDF clásico.
     ```
     BM25_IDF(t) = log( (N - df + 0.5) / (df + 0.5) + 1 )
     ```
+  - **Score final:** suma de `BM25_TF × BM25_IDF` para cada token de la consulta.
 - **Posting list:** lista de documentos asociada a cada término en el índice invertido.
 
 **Limitación:** solo encuentra lo que el usuario escribe textualmente. No entiende sinónimos ni contexto semántico.

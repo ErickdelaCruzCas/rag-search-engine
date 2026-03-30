@@ -15,15 +15,17 @@ rag-search-engine/
 │   ├── data_loader.py             # Loads movies and stopwords from disk
 │   ├── tokenizer.py               # Text normalization, stemming pipeline
 │   └── search_engines/
+│       ├── scorer.py              # TF-IDF and BM25 scoring functions
 │       ├── linear_search.py       # Naive O(n) search (deprecated)
-│       └── inverted_index.py      # Efficient index-based search + TF-IDF
+│       └── inverted_index.py      # Efficient index-based search + BM25
 ├── data/
 │   ├── movies.json                # Movie corpus (title + description)
 │   └── stopwords.txt              # Words to ignore during indexing
 └── cache/                         # Persisted index files (auto-generated)
     ├── index.pkl
     ├── docmap.pkl
-    └── term_frequencies.pkl
+    ├── term_frequencies.pkl
+    └── doc_lengths.pkl
 ```
 
 ---
@@ -115,13 +117,14 @@ token → {set of document IDs that contain it}
 
 At query time, looking up a word is an O(1) dictionary lookup — no scanning needed.
 
-The `InvertedIndex` class ([cli/search_engines/inverted_index.py](cli/search_engines/inverted_index.py)) stores three structures:
+The `InvertedIndex` class ([cli/search_engines/inverted_index.py](cli/search_engines/inverted_index.py)) stores four structures:
 
 | Attribute          | Type                          | Purpose                                      |
 |--------------------|-------------------------------|----------------------------------------------|
 | `index`            | `dict[str, set[int]]`         | Token → set of matching doc IDs             |
 | `docmap`           | `dict[int, dict]`             | Doc ID → full movie object                  |
 | `term_frequencies` | `dict[int, Counter]`          | Doc ID → term count within that document    |
+| `doc_lengths`      | `dict[int, int]`              | Doc ID → raw word count (for BM25 length normalization) |
 
 **Build phase:** The entire corpus is processed once. Each movie's title and description are tokenized together and added to the index.
 
@@ -178,29 +181,48 @@ The CLI exposes all three metrics as individual commands so you can inspect the 
 
 TF-IDF has a flaw: raw TF is unbounded. A term that appears 100 times scores 100× higher than one that appears once, even though in practice the relevance gain tapers off long before that.
 
-**BM25 fixes this with a saturation formula for TF:**
+**BM25 fixes this with two improvements:**
+
+#### Saturation (k1 parameter)
 
 ```
-BM25_TF(term, doc) = (tf × (k1 + 1)) / (tf + k1)
+BM25_TF(term, doc) = (tf × (k1 + 1)) / (tf + k1 × (1 - b + b × |D| / avgdl))
 ```
 
 The `k1` parameter (default `1.5`) controls how fast the score saturates. As `tf` grows, the result asymptotically approaches `k1 + 1` — it never exceeds it, no matter how many times the term appears.
 
-| tf | BM25_TF (k1=1.5) |
-|----|-----------------|
-| 1  | 1.00            |
-| 2  | 1.40            |
-| 5  | 1.67            |
-| 10 | 1.77            |
-| 100| 1.97            |
+#### Length normalization (b parameter)
 
-**BM25 IDF** uses a different formula than classic IDF, which penalises very frequent terms more aggressively:
+The term `(1 - b + b × |D| / avgdl)` normalizes for document length, where:
+- `|D|` = number of words in the document
+- `avgdl` = average document length across the corpus
+- `b` (default `0.75`) controls the strength of the normalization. `b=0` disables it; `b=1` applies full normalization.
+
+This prevents long documents from having an unfair advantage: a term appearing 5 times in a short document should score higher than the same term appearing 5 times in a 10× longer one.
+
+| tf | BM25_TF (k1=1.5, normalized) |
+|----|------------------------------|
+| 1  | ≤ 1.00                       |
+| 2  | ≤ 1.40                       |
+| 5  | ≤ 1.67                       |
+| 10 | ≤ 1.77                       |
+| 100| ≤ 1.97                       |
+
+#### BM25 IDF
+
+Uses a different formula than classic IDF, penalising very frequent terms more aggressively:
 
 ```
 BM25_IDF(term) = log( (N - df + 0.5) / (df + 0.5) + 1 )
 ```
 
-The scoring functions live in `cli/search_engines/scorer.py` (`bm25_tf`, `bm25_idf`).
+#### Full BM25 score
+
+```
+BM25(term, doc) = BM25_TF × BM25_IDF
+```
+
+The final document score for a multi-term query sums BM25 over all query tokens. The scoring functions live in [`cli/search_engines/scorer.py`](cli/search_engines/scorer.py) (`bm25_tf`, `bm25_idf`, `bm25`). Document lengths are stored in `doc_lengths` (raw word count per document, computed at index time and persisted to `cache/doc_lengths.pkl`).
 
 ---
 
@@ -219,8 +241,11 @@ keyword-search build
 ## Usage
 
 ```bash
-# Search for movies
+# Search for movies (keyword, OR logic)
 keyword-search search "space adventure"
+
+# Search for movies ranked by BM25 score
+keyword-search bm25search "love story"
 
 # Get term frequency of "action" in document 42
 keyword-search tf 42 action
@@ -231,9 +256,9 @@ keyword-search idf robot
 # Get TF-IDF score of "war" in document 7
 keyword-search tfidf 7 war
 
-# Get BM25 TF score of "love" in document 1 (optional custom k1)
+# Get BM25 TF score of "love" in document 1 (optional custom k1 and b)
 keyword-search bm25tf 1 love
-keyword-search bm25tf 1 love 2.0
+keyword-search bm25tf 1 love 2.0 0.5
 
 # Get BM25 IDF score of "robot"
 keyword-search bm25idf robot
