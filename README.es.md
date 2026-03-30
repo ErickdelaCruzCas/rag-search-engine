@@ -11,13 +11,15 @@ El dataset es una colección de películas (título + descripción). El motor pe
 ```
 rag-search-engine/
 ├── cli/
-│   ├── keyword_search_cli.py      # Punto de entrada del CLI
+│   ├── keyword_search_cli.py      # CLI de búsqueda por palabras clave
+│   ├── semantic_search_cli.py     # CLI de búsqueda semántica
 │   ├── data_loader.py             # Carga películas y stopwords desde disco
 │   ├── tokenizer.py               # Pipeline de normalización y stemming
 │   └── search_engines/
 │       ├── scorer.py              # Funciones de scoring TF-IDF y BM25
 │       ├── linear_search.py       # Búsqueda ingenua O(n) (deprecada)
-│       └── inverted_index.py      # Búsqueda por índice + BM25
+│       ├── inverted_index.py      # Búsqueda por índice + BM25
+│       └── semantic_search.py     # Búsqueda semántica por embeddings
 ├── data/
 │   ├── movies.json                # Corpus de películas (título + descripción)
 │   └── stopwords.txt              # Palabras a ignorar durante la indexación
@@ -25,7 +27,8 @@ rag-search-engine/
     ├── index.pkl
     ├── docmap.pkl
     ├── term_frequencies.pkl
-    └── doc_lengths.pkl
+    ├── doc_lengths.pkl
+    └── movie_embeddings.npy       # Embeddings pre-calculados de las películas
 ```
 
 ---
@@ -228,6 +231,60 @@ El score final de un documento para una consulta con varios términos suma BM25 
 
 ---
 
+### 8. Embeddings
+
+La búsqueda por palabras clave solo encuentra documentos que contienen exactamente las palabras de la consulta. La búsqueda semántica encuentra documentos con el mismo *significado*, aunque usen palabras completamente distintas.
+
+Un **embedding** es una representación numérica densa de un texto como vector de alta dimensión (por ejemplo, 384 dimensiones para `all-MiniLM-L6-v2`). El modelo está entrenado para que textos semánticamente similares produzcan vectores que apunten en la misma dirección en ese espacio.
+
+```
+"space adventure"     → [0.12, -0.34, 0.87, ...]   ← 384 números
+"interstellar voyage" → [0.11, -0.31, 0.85, ...]   ← vector cercano
+"romantic comedy"     → [-0.42, 0.67, -0.21, ...]  ← vector lejano
+```
+
+La clase `SemanticSearch` ([cli/search_engines/semantic_search.py](cli/search_engines/semantic_search.py)) usa la librería `sentence-transformers` con el modelo `all-MiniLM-L6-v2`. Los embeddings de las 5.000 películas se calculan una sola vez y se guardan en `cache/movie_embeddings.npy`. En ejecuciones posteriores se cargan desde disco, evitando el costoso paso de generación.
+
+---
+
+### 9. Similitud coseno
+
+Para comparar dos vectores de embeddings se usa la **similitud coseno**, que mide el ángulo entre ellos en lugar de la distancia. Esto la hace invariante a la magnitud del vector — solo importa la dirección.
+
+```
+cosine_similarity(A, B) = (A · B) / (|A| × |B|)
+```
+
+El resultado va de **-1.0 a 1.0**:
+
+| Score | Significado |
+|-------|-------------|
+| 1.0   | Los vectores apuntan en la misma dirección (significado idéntico) |
+| 0.0   | Perpendiculares (sin relación) |
+| -1.0  | Direcciones opuestas (significado opuesto) |
+
+En la práctica, los modelos de embeddings producen valores positivos, así que la mayoría de scores caen entre 0 y 1.
+
+---
+
+### 10. Búsqueda semántica
+
+El pipeline completo de búsqueda semántica tiene cinco pasos:
+
+```
+1. Embeder documentos (una vez)  →  almacenar 5.000 vectores de películas en caché
+2. Embeder la consulta (por búsqueda) →  convertir la consulta en un único vector
+3. Similitud coseno               →  comparar el vector de la consulta con cada vector de película
+4. Ordenar                        →  de mayor a menor similitud
+5. Devolver top-K                 →  los resultados más semánticamente relevantes
+```
+
+A diferencia de la búsqueda por palabras clave, esto encuentra películas relevantes aunque la consulta use palabras completamente distintas a las del documento. Una búsqueda de *"space adventure"* devuelve películas descritas como *"an interstellar voyage"* o *"exploring the cosmos"* porque sus embeddings están cerca en el espacio vectorial.
+
+El método `search(query, limit)` de `SemanticSearch` implementa este pipeline. Lanza un `ValueError` si los embeddings no han sido cargados previamente.
+
+---
+
 ## Instalación
 
 ```bash
@@ -236,6 +293,9 @@ uv sync
 
 # Construir el índice invertido (solo una vez)
 keyword-search build
+
+# Generar y guardar los embeddings de las películas (solo una vez, ~20s)
+python cli/semantic_search_cli.py verify_embeddings
 ```
 
 ---
@@ -266,6 +326,18 @@ keyword-search bm25tf 1 love 2.0 0.5
 keyword-search bm25idf robot
 ```
 
+```bash
+# Búsqueda semántica — encontrar películas por significado
+python cli/semantic_search_cli.py search "space adventure"
+python cli/semantic_search_cli.py search "space adventure" --limit 10
+
+# Embeder una consulta e inspeccionar su vector
+python cli/semantic_search_cli.py embedquery "space adventure"
+
+# Verificar la caché de embeddings (la genera si no existe)
+python cli/semantic_search_cli.py verify_embeddings
+```
+
 ---
 
 ## Siguientes pasos (hacia RAG completo)
@@ -273,14 +345,15 @@ keyword-search bm25idf robot
 Este proyecto construye la mitad de **recuperación** de un sistema RAG. El pipeline hasta ahora:
 
 ```
-Consulta → Tokenizar → Búsqueda en índice → Ranking TF-IDF → Top-K documentos
+Consulta → Embeder → Similitud coseno → Top-K documentos (semántica)
+Consulta → Tokenizar → Búsqueda en índice → Ranking BM25 → Top-K documentos (palabras clave)
 ```
 
 En un RAG completo, esos top-K documentos recuperados se pasan como contexto a un modelo de lenguaje (Claude, GPT…), que genera una respuesta fundamentada en la evidencia recuperada, en lugar de inventarse información desde su memoria paramétrica.
 
 Los pasos siguientes serían:
 
-- Reemplazar la búsqueda por palabras clave con **búsqueda vectorial densa** (embeddings + similitud coseno)
+- Combinar los resultados de ambas búsquedas con **hybrid search** (fusión RRF)
 - Añadir un **re-ranker** para mejorar el orden de los resultados
 - Pasar los mejores resultados a un **prompt de LLM** para la generación de respuestas
 
@@ -384,7 +457,11 @@ En lugar de buscar palabras exactas, busca por **significado**. Dos frases con p
   ```
 - **Dense retrieval:** recuperación densa — todos los documentos están representados como vectores y la búsqueda es una comparación vectorial, no de palabras.
 - **Vector store / base de datos vectorial:** base de datos optimizada para almacenar y consultar vectores eficientemente. Ejemplos: Pinecone, Qdrant, Chroma, Weaviate, pgvector.
-- **ANN (Approximate Nearest Neighbors):** algoritmos como HNSW o FAISS que encuentran los vectores más cercanos de forma aproximada pero muy rápida, sin comparar contra todos los vectores.
+- **ANN (Approximate Nearest Neighbors):** en producción no puedes comparar la query contra todos los vectores — con millones de documentos sería O(N) y demasiado lento. Los algoritmos ANN renuncian a exactitud perfecta a cambio de velocidad brutal, reduciendo la búsqueda a algo sublineal. Los tres más importantes:
+  - **HNSW (Hierarchical Navigable Small World):** construye un grafo multinivel. Al buscar empieza en las capas superiores (visión coarse, saltos largos) y baja refinando. Muy rápido y buena recall. Es el estándar en la mayoría de vector databases modernas.
+  - **IVF (Inverted File Index):** divide el espacio en clusters con k-means. Solo busca en los clusters más cercanos al query vector, ignorando el resto. Trade-off controlable: más clusters → más precisión, menos velocidad.
+  - **LSH (Locality-Sensitive Hashing):** genera hashes que preservan similitud — vectores cercanos caen en el mismo bucket. Solo compara dentro del bucket, sin ver el resto. Muy rápido, pero normalmente menos preciso que HNSW.
+- **Vector store / base de datos vectorial:** base de datos optimizada para almacenar vectores y ejecutar búsquedas ANN eficientemente. Ejemplos: Pinecone, Qdrant, Chroma, Weaviate, pgvector. Bajo el capó usan HNSW, IVF o LSH (o combinaciones) para no hacer fuerza bruta contra todos los vectores.
 
 **Ventaja sobre keyword search:** entiende sinónimos, paráfrasis y contexto. `"coche"` y `"automóvil"` quedan cerca en el espacio vectorial.
 

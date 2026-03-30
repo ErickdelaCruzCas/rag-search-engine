@@ -11,13 +11,15 @@ The dataset is a collection of movies (title + description). The engine lets you
 ```
 rag-search-engine/
 ├── cli/
-│   ├── keyword_search_cli.py      # CLI entry point
+│   ├── keyword_search_cli.py      # Keyword search CLI entry point
+│   ├── semantic_search_cli.py     # Semantic search CLI entry point
 │   ├── data_loader.py             # Loads movies and stopwords from disk
 │   ├── tokenizer.py               # Text normalization, stemming pipeline
 │   └── search_engines/
 │       ├── scorer.py              # TF-IDF and BM25 scoring functions
 │       ├── linear_search.py       # Naive O(n) search (deprecated)
-│       └── inverted_index.py      # Efficient index-based search + BM25
+│       ├── inverted_index.py      # Efficient index-based search + BM25
+│       └── semantic_search.py     # Embedding-based semantic search
 ├── data/
 │   ├── movies.json                # Movie corpus (title + description)
 │   └── stopwords.txt              # Words to ignore during indexing
@@ -25,7 +27,8 @@ rag-search-engine/
     ├── index.pkl
     ├── docmap.pkl
     ├── term_frequencies.pkl
-    └── doc_lengths.pkl
+    ├── doc_lengths.pkl
+    └── movie_embeddings.npy       # Pre-computed movie embeddings
 ```
 
 ---
@@ -226,6 +229,80 @@ The final document score for a multi-term query sums BM25 over all query tokens.
 
 ---
 
+### 8. Embeddings
+
+Keyword search only finds documents that contain the exact words in the query. Semantic search finds documents that have the same *meaning*, even if they use completely different words.
+
+An **embedding** is a dense numerical representation of text as a high-dimensional vector (e.g. 384 dimensions for `all-MiniLM-L6-v2`). The model is trained so that semantically similar texts produce vectors that point in roughly the same direction in that space.
+
+```
+"space adventure"     → [0.12, -0.34, 0.87, ...]   ← 384 numbers
+"interstellar voyage" → [0.11, -0.31, 0.85, ...]   ← nearby vector
+"romantic comedy"     → [-0.42, 0.67, -0.21, ...]  ← far away vector
+```
+
+The `SemanticSearch` class ([cli/search_engines/semantic_search.py](cli/search_engines/semantic_search.py)) uses the `sentence-transformers` library with the `all-MiniLM-L6-v2` model. Embeddings for all 5,000 movies are computed once and cached to `cache/movie_embeddings.npy`. On subsequent runs they are loaded from disk, skipping the expensive generation step.
+
+---
+
+### 9. Cosine Similarity
+
+To compare two embedding vectors we use **cosine similarity**, which measures the angle between them rather than their distance. This makes it invariant to vector magnitude — only direction matters.
+
+```
+cosine_similarity(A, B) = (A · B) / (|A| × |B|)
+```
+
+The result ranges from **-1.0 to 1.0**:
+
+| Score | Meaning |
+|-------|---------|
+| 1.0   | Vectors point in the same direction (identical meaning) |
+| 0.0   | Perpendicular (unrelated) |
+| -1.0  | Opposite directions (opposite meaning) |
+
+In practice, embedding models produce positive values, so most scores fall between 0 and 1.
+
+---
+
+### 10. Semantic Search
+
+The full semantic search pipeline has five steps:
+
+```
+1. Embed documents (once)  →  store 5,000 movie vectors in cache
+2. Embed query (per search) →  convert query to a single vector
+3. Cosine similarity        →  compare query vector to every movie vector
+4. Rank                     →  sort by similarity score (descending)
+5. Return top-K             →  surface the most semantically relevant results
+```
+
+Unlike keyword search, this finds relevant movies even when the query uses completely different words than the document. A search for *"space adventure"* will surface films described as *"an interstellar voyage"* or *"exploring the cosmos"* because their embeddings are nearby in vector space.
+
+The `search(query, limit)` method in `SemanticSearch` implements this pipeline. It raises a `ValueError` if embeddings have not been loaded first.
+
+---
+
+### 11. Approximate Nearest Neighbor (ANN) Search
+
+The semantic search implemented here does a brute-force comparison: every query vector is compared against all 5,000 movie vectors. That's fine for 5,000 documents, but at millions of vectors it becomes O(N) and too slow for production.
+
+**ANN algorithms** solve this by trading a small amount of accuracy for a massive speed gain. Instead of scanning everything, they navigate data structures (graphs, clusters, hash buckets) to jump directly to promising regions of the vector space.
+
+All three main approaches share the same two properties:
+- They are **approximate** — they don't always return the mathematically closest vector.
+- They are **fast** — search complexity drops from O(N) to something sublinear (logarithmic or better).
+
+| Algorithm | How it works | Trade-off |
+|-----------|-------------|-----------|
+| **HNSW** (Hierarchical Navigable Small World) | Multilevel graph. Search starts at the top (coarse, long jumps) and refines going down. | Best recall and speed. The default in most modern vector databases. |
+| **IVF** (Inverted File Index) | k-means clustering. Only searches the nearest clusters, ignores the rest. | Controllable: more clusters → more precision, less speed. |
+| **LSH** (Locality-Sensitive Hashing) | Hashes that preserve similarity — close vectors land in the same bucket. Only compares within the bucket. | Very fast, but usually lower recall than HNSW. |
+
+**Vector databases** (Pinecone, Qdrant, Chroma, Weaviate, pgvector) are storage engines built around these ANN algorithms. They handle indexing, persistence, filtering, and ANN search so you don't have to implement it yourself.
+
+---
+
 ## Setup
 
 ```bash
@@ -234,6 +311,9 @@ uv sync
 
 # Build the inverted index (run once)
 keyword-search build
+
+# Generate and cache movie embeddings (run once, takes ~20s)
+python cli/semantic_search_cli.py verify_embeddings
 ```
 
 ---
@@ -264,6 +344,18 @@ keyword-search bm25tf 1 love 2.0 0.5
 keyword-search bm25idf robot
 ```
 
+```bash
+# Semantic search — find movies by meaning
+python cli/semantic_search_cli.py search "space adventure"
+python cli/semantic_search_cli.py search "space adventure" --limit 10
+
+# Embed a single query and inspect its vector
+python cli/semantic_search_cli.py embedquery "space adventure"
+
+# Verify embeddings cache (generates it on first run)
+python cli/semantic_search_cli.py verify_embeddings
+```
+
 ---
 
 ## What's Next (RAG)
@@ -271,12 +363,13 @@ keyword-search bm25idf robot
 This project builds the **retrieval** half of a RAG system. The pipeline so far:
 
 ```
-Query → Tokenize → Index Lookup → TF-IDF Ranking → Top-K Documents
+Query → Embed → Cosine Similarity → Top-K Documents (semantic)
+Query → Tokenize → Index Lookup → BM25 Ranking → Top-K Documents (keyword)
 ```
 
 In a full RAG setup, those top-K retrieved documents are passed as context to a language model (e.g. Claude, GPT), which then generates a grounded answer based on the retrieved evidence — rather than hallucinating from its parametric memory alone.
 
 The next steps would be:
-- Replace keyword matching with **dense vector search** (embeddings + cosine similarity)
+- Combine keyword and semantic results with **hybrid search** (RRF fusion)
 - Add a **re-ranker** to improve result ordering
 - Pipe the top results into an **LLM prompt** for answer generation
