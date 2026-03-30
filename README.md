@@ -373,3 +373,295 @@ The next steps would be:
 - Combine keyword and semantic results with **hybrid search** (RRF fusion)
 - Add a **re-ranker** to improve result ordering
 - Pipe the top results into an **LLM prompt** for answer generation
+
+---
+
+## Estrategias de Chunking en RAG
+
+El chunking es el proceso de dividir documentos largos en fragmentos más pequeños antes de indexarlos. Los modelos de embeddings tienen un límite de tokens (típicamente 256–512), y los LLMs tienen una ventana de contexto finita. Decidir *cómo* partir el texto es una de las decisiones de ingeniería con mayor impacto en la calidad final de un sistema RAG.
+
+Esta sección describe las 8 estrategias principales, su base algorítmica, su implementación práctica y sus compromisos de rendimiento.
+
+---
+
+### 1. Chunking de tamaño fijo (Fixed-Size Chunking)
+
+El chunking de tamaño fijo divide el texto en fragmentos de exactamente N tokens o palabras, sin considerar la estructura semántica del contenido. Es la estrategia más simple y la más rápida de implementar: se recorre la lista de palabras como un array y se agrupa cada N elementos.
+
+El problema principal es que ignora completamente los límites naturales del lenguaje. Una frase puede quedar partida a la mitad, repartida entre dos chunks distintos. Si la información relevante para responder una pregunta cae exactamente en ese corte, ninguno de los dos chunks la contendrá completa, y el retrieval fallará aunque el documento correcto esté indexado.
+
+Es apropiado cuando los documentos son homogéneos en estructura (logs, registros tabulares, texto continuo sin estructura narrativa) y cuando la velocidad de indexación prima sobre la calidad de retrieval.
+
+**Concepto DSA subyacente:** particionado de array en bloques de tamaño fijo. Tiempo O(N), espacio O(N/k) chunks donde k es el tamaño. Sin estado, sin lookahead.
+
+```python
+def fixed_chunk(text: str, chunk_size: int = 200) -> list[str]:
+    words = text.split()
+    return [
+        " ".join(words[i:i + chunk_size])
+        for i in range(0, len(words), chunk_size)
+    ]
+
+chunks = fixed_chunk(document, chunk_size=150)
+```
+
+**Complejidad:** O(N) tiempo, O(N) espacio. Índice de tamaño proporcional al corpus. Sin overhead de computo en indexación. El cuello de botella es el modelo de embeddings, no el chunking en sí.
+
+---
+
+### 2. Chunk con solapamiento (Sliding Window / Chunk Overlap)
+
+El chunking con solapamiento es una extensión directa del fijo: en lugar de avanzar k palabras entre chunks, avanza `k - overlap`. Las últimas `overlap` palabras del chunk anterior se repiten al inicio del siguiente, creando una ventana deslizante sobre el texto.
+
+El objetivo es mitigar el problema del corte: si una pieza de información relevante cae cerca de un límite, al menos uno de los dos chunks solapados la contendrá completa. Es especialmente útil cuando las preguntas del usuario hacen referencia a conceptos que se desarrollan a lo largo de varias frases.
+
+El coste directo es el aumento del número de chunks indexados. Con un overlap del 50%, se generan aproximadamente el doble de chunks, lo que duplica el coste de embeddings y el tamaño del índice vectorial.
+
+**Concepto DSA subyacente:** ventana deslizante (sliding window). Estructura clásica para problemas donde el contexto local entre elementos adyacentes es importante. El puntero avanza `chunk_size - overlap` posiciones en cada iteración en lugar de `chunk_size`.
+
+```python
+def overlapping_chunk(text: str, chunk_size: int = 200, overlap: int = 50) -> list[str]:
+    words = text.split()
+    chunks = []
+    i = 0
+    while i < len(words):
+        chunks.append(" ".join(words[i:i + chunk_size]))
+        i += chunk_size - overlap
+    return chunks
+
+chunks = overlapping_chunk(document, chunk_size=150, overlap=30)
+```
+
+**Complejidad:** O(N · overlap/chunk_size) chunks adicionales respecto al fijo. Con overlap=0 equivale al fixed chunking. A mayor overlap, mayor redundancia en el índice y mayor coste de retrieval por aumento del número de candidatos.
+
+---
+
+### 3. Chunking semántico (Semantic Chunking / Similarity-Based Boundary Detection)
+
+En lugar de partir por número de palabras, el chunking semántico parte por significado: detecta los puntos del texto donde el tema cambia y usa esos puntos como fronteras naturales entre chunks. La versión simple usa límites de frase (signos de puntuación); la versión avanzada embede cada frase y busca los puntos donde la similitud coseno entre frases consecutivas cae por debajo de un umbral.
+
+El principio es que frases consecutivas dentro de un mismo párrafo o argumento tienen embeddings cercanos. Cuando el tema cambia, la similitud cae bruscamente. Ese punto de inflexión es la frontera del chunk. El resultado son chunks que contienen ideas completas, no fragmentos arbitrarios de texto.
+
+La versión basada en frases (regex) es O(N) y no requiere embeddings. La versión basada en similitud embede cada frase individualmente, lo que tiene un coste alto en indexación pero produce chunks mucho más coherentes semánticamente.
+
+**Concepto DSA subyacente:** detección de puntos de ruptura (breakpoint detection) sobre una secuencia. Similar a la detección de anomalías en series temporales: se busca el punto donde una métrica (similitud coseno) cae por debajo de un umbral dinámico o estático.
+
+```python
+import re
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+def semantic_chunk(text: str, threshold: float = 0.5) -> list[str]:
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    embeddings = model.encode(sentences)
+
+    chunks, current = [], [sentences[0]]
+    for i in range(1, len(sentences)):
+        sim = np.dot(embeddings[i-1], embeddings[i]) / (
+            np.linalg.norm(embeddings[i-1]) * np.linalg.norm(embeddings[i])
+        )
+        if sim < threshold:
+            chunks.append(" ".join(current))
+            current = []
+        current.append(sentences[i])
+    if current:
+        chunks.append(" ".join(current))
+    return chunks
+```
+
+**Complejidad:** O(S) llamadas al modelo de embeddings donde S es el número de frases. Mucho más caro que el fixed chunking en indexación. El tamaño del índice resultante es menor porque los chunks son más coherentes y hay menos redundancia.
+
+---
+
+### 4. Embeddings por chunk (Chunked Semantic Embeddings / Vector Indexing per Chunk)
+
+Una vez que el texto está dividido en chunks, cada uno se convierte en un vector de alta dimensión con un modelo de embeddings. Estos vectores se almacenan en un índice vectorial (FAISS, Qdrant, pgvector) junto con metadata que permite recuperar el texto original y su origen (documento, página, sección).
+
+La diferencia respecto a embeder documentos completos es de granularidad: en lugar de un vector por documento, hay N vectores por documento (uno por chunk). El retrieval devuelve el chunk específico que contiene la información, no el documento entero. Esto es crítico cuando los documentos son largos: el LLM recibe solo el fragmento relevante, no todo el libro.
+
+El diseño del índice es un problema de ingeniería no trivial: hay que decidir si normalizar los vectores (para usar dot product en lugar de coseno), qué algoritmo ANN usar (HNSW para alta recall, IVF para datasets masivos), y cómo almacenar la metadata de forma que el filtrado por fuente o fecha sea eficiente.
+
+**Concepto DSA subyacente:** modelo de espacio vectorial (Vector Space Model) con índice ANN. Cada chunk es un punto en un espacio de alta dimensión. El retrieval es una búsqueda de vecinos más cercanos. HNSW construye un grafo de proximidad en múltiples niveles para hacer esa búsqueda en O(log N) en lugar de O(N).
+
+```python
+import numpy as np
+from sentence_transformers import SentenceTransformer
+
+def build_chunk_index(chunks: list[str], model_name: str = "all-MiniLM-L6-v2"):
+    model = SentenceTransformer(model_name)
+    embeddings = model.encode(chunks, show_progress_bar=True)
+    # Normalizar para usar dot product como proxy de similitud coseno
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    normalized = embeddings / norms
+    return normalized, chunks
+
+embeddings, chunk_texts = build_chunk_index(chunks)
+np.save("cache/chunk_embeddings.npy", embeddings)
+```
+
+**Complejidad:** O(C) embeddings donde C es el número de chunks. El índice ocupa C × D floats (D = dimensiones del modelo, típicamente 384–1536). Con C=100k chunks y D=384, son ~150MB en float32. HNSW añade overhead de grafo (~400MB adicionales para 100k vectores con parámetros típicos).
+
+---
+
+### 5. Búsqueda semántica por chunks (Chunked Semantic Search / Top-K Retrieval)
+
+El retrieval sobre un índice de chunks es conceptualmente idéntico al retrieval sobre documentos: se embede la query, se calcula similitud coseno contra todos los vectores del índice, y se devuelven los K más cercanos. La diferencia es que cada resultado es un chunk, no un documento completo.
+
+Un problema específico del retrieval por chunks es la **redundancia**: si el mismo documento tiene varios chunks relevantes, todos pueden aparecer en el top-K, ocupando espacio de contexto del LLM con información repetida. La solución es aplicar **max-margin diversity** o **deduplicación por documento**: si ya hay un chunk del documento X en los resultados, los siguientes chunks del mismo documento reciben una penalización.
+
+Otro problema es el **contexto perdido**: el chunk recuperado puede ser correcto pero carecer del contexto necesario para que el LLM lo entienda (por ejemplo, un chunk que empieza con "Sin embargo, esto implica que..."). Una solución es recuperar también los chunks adyacentes en el documento original.
+
+**Concepto DSA subyacente:** búsqueda de vecinos más cercanos (KNN/ANN) en espacio vectorial de alta dimensión. El problema es equivalente a encontrar los K puntos más cercanos en un espacio métrico. La complejidad depende del algoritmo: O(N·D) fuerza bruta, O(log N · D) con HNSW, O(√N · D) con IVF.
+
+```python
+def search_chunks(
+    query: str,
+    embeddings: np.ndarray,
+    chunks: list[str],
+    model,
+    top_k: int = 5
+) -> list[dict]:
+    query_vec = model.encode([query])[0]
+    query_vec = query_vec / np.linalg.norm(query_vec)
+
+    scores = embeddings @ query_vec  # dot product sobre vectores normalizados
+    top_indices = np.argsort(scores)[::-1][:top_k]
+
+    return [
+        {"score": float(scores[i]), "chunk": chunks[i]}
+        for i in top_indices
+    ]
+```
+
+**Complejidad:** O(C·D) fuerza bruta, donde C = número de chunks y D = dimensiones. En producción, ANN reduce esto a O(log C · D). El cuello de botella en latencia suele ser el embedding de la query (una llamada al modelo), no la búsqueda en sí.
+
+---
+
+### 6. Casos extremos de chunking (Chunked Edge Cases)
+
+El chunking de texto narrativo es relativamente sencillo, pero los documentos reales contienen estructuras que el chunking por palabras o frases destruye: tablas, bloques de código, fórmulas matemáticas, listas numeradas, y documentos extremadamente cortos.
+
+Una tabla partido a la mitad pierde su estructura relacional — las columnas de la segunda mitad no tienen cabecera. Un bloque de código partido en medio de una función es inútil para el LLM. Un documento de 50 palabras no debería partirse en absoluto. Cada uno de estos casos requiere una estrategia diferente.
+
+El enfoque robusto en producción es un **chunker jerárquico**: primero detecta el tipo de cada bloque (texto, código, tabla, lista) usando heurísticas o un parser de Markdown/HTML, luego aplica la estrategia apropiada a cada bloque. Los bloques de código y tablas se indexan completos o con separadores especiales que preservan su estructura.
+
+**Concepto DSA subyacente:** árbol de análisis sintáctico (parse tree) sobre la estructura del documento. El documento se modela como un árbol donde los nodos son secciones, párrafos, tablas y bloques de código. El chunking respeta los límites del árbol en lugar de ignorarlos.
+
+```python
+import re
+
+def smart_chunk(text: str, chunk_size: int = 200) -> list[str]:
+    # Extraer bloques de código antes de partir
+    code_blocks = re.findall(r"```[\s\S]*?```", text)
+    protected = {}
+    for i, block in enumerate(code_blocks):
+        placeholder = f"__CODE_BLOCK_{i}__"
+        text = text.replace(block, placeholder)
+        protected[placeholder] = block
+
+    # Chunking normal sobre el texto sin código
+    words = text.split()
+    chunks = []
+    i = 0
+    while i < len(words):
+        chunk_words = words[i:i + chunk_size]
+        chunk = " ".join(chunk_words)
+        # Restaurar bloques de código
+        for placeholder, block in protected.items():
+            chunk = chunk.replace(placeholder, block)
+        chunks.append(chunk)
+        i += chunk_size
+
+    return chunks
+```
+
+**Complejidad:** O(N) para el chunking base más O(B) para detectar y restaurar B bloques especiales. El overhead es mínimo. El coste real es la complejidad de implementación y mantenimiento de las heurísticas de detección de tipos.
+
+---
+
+### 7. ColBERT (Late Interaction Retrieval)
+
+ColBERT (Contextualized Late Interaction over BERT) es un enfoque radicalmente diferente al retrieval por embedding único. En lugar de comprimir cada documento en un solo vector, ColBERT produce **un vector por token** tanto para la query como para el documento. La puntuación final se calcula con una operación de "late interaction": para cada token de la query, se encuentra su token más similar en el documento (MaxSim), y se suman esas similitudes máximas.
+
+La ventaja es precisión: un embedding único pierde información al comprimir cientos de tokens en un solo vector. ColBERT preserva la representación token a token y calcula la interacción en tiempo de retrieval, no de indexación. El resultado es una recall y precision significativamente superiores, especialmente en queries complejas con múltiples conceptos.
+
+El coste es espacio: en lugar de 1 vector por chunk, hay T vectores por chunk (donde T es la longitud en tokens). Para un corpus de 1M chunks con longitud media de 100 tokens y 128 dimensiones, el índice ColBERT ocupa ~50GB frente a ~400MB de un bi-encoder estándar.
+
+**Concepto DSA subyacente:** producto de matrices con reducción MaxSim. Para cada token de query qi, se calcula `max_j(qi · dj)` sobre todos los tokens dj del documento. El score final es `Σ_i max_j(qi · dj)`. En práctica se implementa como una multiplicación matricial Q×D^T seguida de un max por fila y una suma.
+
+```python
+import torch
+from colbert.infra import Run, RunConfig, ColBERTConfig
+from colbert import Indexer, Searcher
+
+# Indexar documentos
+with Run().context(RunConfig(nranks=1, experiment="rag")):
+    config = ColBERTConfig(doc_maxlen=220, nbits=2)
+    indexer = Indexer(checkpoint="colbert-ir/colbertv2.0", config=config)
+    indexer.index(name="my_index", collection=chunks, overwrite=True)
+
+# Buscar
+with Run().context(RunConfig(experiment="rag")):
+    searcher = Searcher(index="my_index")
+    results = searcher.search("space adventure", k=5)
+    for rank, (doc_id, _, score) in enumerate(zip(*results)):
+        print(f"{rank+1}. [{score:.2f}] {chunks[doc_id]}")
+```
+
+**Complejidad:** indexación O(C·T·D) donde T es la longitud media en tokens. Retrieval: fase FAISS O(log C) para preselección, fase MaxSim O(K·T·T_q) sobre los K candidatos. El índice ocupa O(C·T·D) floats — típicamente 100× más que un bi-encoder. La librería `RAGatouille` simplifica la integración con pipelines existentes.
+
+---
+
+### 8. Late Chunking (Document-Level Encoding + Post-Pooling)
+
+Late Chunking invierte el orden habitual: en lugar de partir el texto primero y embeder después, embede primero el documento completo y parte después. El modelo procesa el documento entero en un solo pase, produciendo un embedding contextualizado por token. Luego se definen los límites de chunk y se hace **mean pooling** sobre los tokens de cada chunk para obtener su vector representativo.
+
+La ventaja clave es que cada token se representa teniendo en cuenta el contexto completo del documento. En el chunking tradicional, el primer token de cada chunk no "ve" el texto anterior porque fue truncado. Con late chunking, un pronombre como "él" en el chunk 3 puede estar correctamente asociado a la entidad que introdujo el chunk 1, porque el modelo procesó ambos juntos.
+
+La limitación obvia es la ventana de contexto del modelo: si el documento supera el máximo de tokens soportado (típicamente 8k–128k según el modelo), no puede procesarse entero. Late chunking solo es aplicable cuando el documento cabe íntegro en el contexto del encoder.
+
+**Concepto DSA subyacente:** pooling sobre particiones de una secuencia de vectores token. El modelo produce una matriz T×D (tokens × dimensiones). Los límites de chunk definen intervalos [a, b] sobre el eje T. El embedding de cada chunk es `mean(embeddings[a:b], axis=0)` — una operación de reducción sobre submatrices.
+
+```python
+from transformers import AutoTokenizer, AutoModel
+import torch
+import numpy as np
+
+def late_chunk(text: str, chunk_boundaries: list[int], model_name: str = "BAAI/bge-m3"):
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModel.from_pretrained(model_name)
+
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=8192)
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+    # outputs.last_hidden_state: [1, T, D]
+    token_embeddings = outputs.last_hidden_state[0]  # [T, D]
+
+    chunk_embeddings = []
+    prev = 0
+    for boundary in chunk_boundaries + [token_embeddings.shape[0]]:
+        chunk_vec = token_embeddings[prev:boundary].mean(dim=0)
+        chunk_embeddings.append(chunk_vec.numpy())
+        prev = boundary
+
+    return np.array(chunk_embeddings)
+```
+
+**Complejidad:** O(T²) atención del transformer sobre el documento completo (el coste dominante). El pooling posterior es O(T·D). Para documentos largos, modelos con atención eficiente (FlashAttention, linear attention) reducen el cuadrático a O(T·log T) o O(T). El resultado es un número de embeddings igual al número de chunks, igual que el enfoque tradicional, pero con mejor calidad de representación.
+
+---
+
+### Tabla comparativa
+
+| Estrategia | Coherencia del chunk | Impacto en tamaño del índice | Calidad de retrieval | Coste computacional |
+|---|---|---|---|---|
+| Fixed-size chunking | Bajo | Bajo | Bajo | Bajo |
+| Chunk overlap | Bajo–Medio | Medio (redundancia) | Medio | Bajo |
+| Semantic chunking | Alto | Bajo–Medio | Alto | Medio (embeddings por frase) |
+| Chunked semantic embeddings | Medio | Medio | Medio–Alto | Medio |
+| Chunked semantic search | Medio | Medio | Alto | Medio |
+| Chunked edge cases | Alto | Medio | Medio–Alto | Bajo–Medio |
+| ColBERT | Alto | Muy alto (100×) | Muy alto | Alto |
+| Late chunking | Muy alto | Bajo (igual al fixed) | Alto | Alto (encoder full-doc) |
