@@ -7,7 +7,7 @@ project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
 import argparse
-from cli.search_engines.semantic_search import verify_embeddings, embed_text
+from cli.search_engines.semantic_search import verify_embeddings, embed_text, embed_query_text
 
 
 def main():
@@ -19,6 +19,9 @@ def main():
     embed_parser = subparsers.add_parser("embed_text", help="Generate an embedding for a text input")
     embed_parser.add_argument("text", type=str, help="Text to embed")
 
+    embedquery_parser = subparsers.add_parser("embedquery", help="Embed a search query")
+    embedquery_parser.add_argument("query", type=str, help="Query to embed")
+
     args = parser.parse_args()
 
     match args.command:
@@ -26,6 +29,8 @@ def main():
             verify_embeddings()
         case "embed_text":
             embed_text(args.text)
+        case "embedquery":
+            embed_query_text(args.query)
         case _:
             parser.print_help()
 
